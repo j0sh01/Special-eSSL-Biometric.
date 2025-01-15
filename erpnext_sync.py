@@ -41,60 +41,53 @@ def main():
     """Takes care of checking if it is time to pull data based on config,
     then calling the relevant functions to pull data and push to ERPNext."""
     
-    # Updated: Open the shelve database
-    status_file = '/'.join([config.LOGS_DIRECTORY, 'status.json'])
-    status = shelve.open(status_file)
-
-    try:
-        last_lift_off_timestamp = _safe_convert_date(status.get('lift_off_timestamp'), "%Y-%m-%d %H:%M:%S.%f")
-        if (last_lift_off_timestamp and last_lift_off_timestamp < datetime.datetime.now() - datetime.timedelta(minutes=config.PULL_FREQUENCY)) or not last_lift_off_timestamp:
-            status['lift_off_timestamp'] = str(datetime.datetime.now())  # Updated: Use shelve syntax
-            info_logger.info("Cleared for lift off!")
-            
-            for device in config.devices:
-                device_attendance_logs = None
-                info_logger.info("Processing Device: " + device['device_id'])
-                dump_file = get_dump_file_name_and_directory(device['device_id'], device['ip'])
+    status_file = os.path.join(config.LOGS_DIRECTORY, 'status')  # Removed .json extension for shelve
+    with shelve.open(status_file) as status:
+        try:
+            last_lift_off_timestamp = _safe_convert_date(status.get('lift_off_timestamp'), "%Y-%m-%d %H:%M:%S.%f")
+            if (last_lift_off_timestamp and last_lift_off_timestamp < datetime.datetime.now() - datetime.timedelta(minutes=config.PULL_FREQUENCY)) or not last_lift_off_timestamp:
+                status['lift_off_timestamp'] = str(datetime.datetime.now())
+                info_logger.info("Cleared for lift off!")
                 
-                if os.path.exists(dump_file):
-                    info_logger.error('Device Attendance Dump Found in Log Directory. Retrying with dumped data.')
-                    with open(dump_file, 'r') as f:
-                        file_contents = f.read()
-                        if file_contents:
-                            device_attendance_logs = list(map(lambda x: _apply_function_to_key(x, 'timestamp', datetime.datetime.fromtimestamp), json.loads(file_contents)))
-
-                try:
-                    pull_process_and_push_data(device, device_attendance_logs)
-                    status[f'{device["device_id"]}_push_timestamp'] = str(datetime.datetime.now())  # Updated: Use shelve syntax
+                for device in config.devices:
+                    device_attendance_logs = None
+                    info_logger.info("Processing Device: " + device['device_id'])
+                    dump_file = get_dump_file_name_and_directory(device['device_id'], device['ip'])
+                    
                     if os.path.exists(dump_file):
-                        os.remove(dump_file)
-                    info_logger.info("Successfully processed Device: " + device['device_id'])
-                except:
-                    error_logger.exception('Exception when calling pull_process_and_push_data function for device' + json.dumps(device, default=str))
-            
-            if hasattr(config, 'shift_type_device_mapping'):
-                update_shift_last_sync_timestamp(config.shift_type_device_mapping)
-            
-            status['mission_accomplished_timestamp'] = str(datetime.datetime.now())  # Updated: Use shelve syntax
-            info_logger.info("Mission Accomplished!")
-    except:
-        error_logger.exception('Exception has occurred in the main function...')
-    finally:
-        status.close()  # Updated: Ensure the shelve is properly closed
+                        info_logger.error('Device Attendance Dump Found in Log Directory. Retrying with dumped data.')
+                        with open(dump_file, 'r') as f:
+                            file_contents = f.read()
+                            if file_contents:
+                                device_attendance_logs = list(map(lambda x: _apply_function_to_key(x, 'timestamp', datetime.datetime.fromtimestamp), json.loads(file_contents)))
 
-def pull_process_and_push_data(device, device_attendance_logs=None):
-    """ Takes a single device config as param and pulls data from that device.
+                    try:
+                        pull_process_and_push_data(device, status, device_attendance_logs)
+                        status[f'{device["device_id"]}_push_timestamp'] = str(datetime.datetime.now())
+                        if os.path.exists(dump_file):
+                            os.remove(dump_file)
+                        info_logger.info("Successfully processed Device: " + device['device_id'])
+                    except Exception as e:
+                        error_logger.exception('Exception when calling pull_process_and_push_data function for device' + json.dumps(device, default=str))
+                
+                if hasattr(config, 'shift_type_device_mapping'):
+                    update_shift_last_sync_timestamp(config.shift_type_device_mapping, status)
+                
+                status['mission_accomplished_timestamp'] = str(datetime.datetime.now())
+                info_logger.info("Mission Accomplished!")
+        except Exception as e:
+            error_logger.exception('Exception has occurred in the main function...')
 
-    params:
-    device: a single device config object from the local_config file
-    device_attendance_logs: fetching from device is skipped if this param is passed. used to restart failed fetches from previous runs.
-    """
+def pull_process_and_push_data(device, status, device_attendance_logs=None):
+    """ Takes a single device config and status object as params and pulls data from that device. """
     attendance_success_log_file = '_'.join(["attendance_success_log", device['device_id']])
     attendance_failed_log_file = '_'.join(["attendance_failed_log", device['device_id']])
-    attendance_success_logger = setup_logger(attendance_success_log_file, '/'.join([config.LOGS_DIRECTORY, attendance_success_log_file]) + '.log')
-    attendance_failed_logger = setup_logger(attendance_failed_log_file, '/'.join([config.LOGS_DIRECTORY, attendance_failed_log_file]) + '.log')
+    attendance_success_logger = setup_logger(attendance_success_log_file, os.path.join(config.LOGS_DIRECTORY, attendance_success_log_file) + '.log')
+    attendance_failed_logger = setup_logger(attendance_failed_log_file, os.path.join(config.LOGS_DIRECTORY, attendance_failed_log_file) + '.log')
+    
     if not device_attendance_logs:
-        device_attendance_logs = get_all_attendance_from_device(device['ip'], device_id=device['device_id'], clear_from_device_on_fetch=device['clear_from_device_on_fetch'])
+        device_attendance_logs = get_all_attendance_from_device(device['ip'], status, device_id=device['device_id'], 
+                                                             clear_from_device_on_fetch=device['clear_from_device_on_fetch'])
         if not device_attendance_logs:
             return
     # for finding the last successful push and restart from that point (or) from a set 'config.IMPORT_START_DATE' (whichever is later)
@@ -147,40 +140,38 @@ def pull_process_and_push_data(device, device_attendance_logs=None):
             if not (any(error in erpnext_message for error in allowlisted_errors)):
                 raise Exception('API Call to ERPNext Failed.')
 
-
-def get_all_attendance_from_device(ip, port=4370, timeout=30, device_id=None, clear_from_device_on_fetch=False):
-    #  Sample Attendance Logs [{'punch': 255, 'user_id': '22', 'uid': 12349, 'status': 1, 'timestamp': datetime.datetime(2019, 2, 26, 20, 31, 29)},{'punch': 255, 'user_id': '7', 'uid': 7, 'status': 1, 'timestamp': datetime.datetime(2019, 2, 26, 20, 31, 36)}]
+def get_all_attendance_from_device(ip, status, port=4370, timeout=30, device_id=None, clear_from_device_on_fetch=False):
     zk = ZK(ip, port=port, timeout=timeout)
     conn = None
     attendances = []
     try:
         conn = zk.connect()
         x = conn.disable_device()
-        # device is disabled when fetching data
         info_logger.info("\t".join((ip, "Device Disable Attempted. Result:", str(x))))
         attendances = conn.get_attendance()
         info_logger.info("\t".join((ip, "Attendances Fetched:", str(len(attendances)))))
-        status.set(f'{device_id}_push_timestamp', None)
-        status.set(f'{device_id}_pull_timestamp', str(datetime.datetime.now()))
+        
+        if device_id:
+            status[f'{device_id}_push_timestamp'] = None
+            status[f'{device_id}_pull_timestamp'] = str(datetime.datetime.now())
+            
         if len(attendances):
-            # keeping a backup before clearing data incase the programs fails.
-            # if everything goes well then this file is removed automatically at the end.
             dump_file_name = get_dump_file_name_and_directory(device_id, ip)
             with open(dump_file_name, 'w+') as f:
                 f.write(json.dumps(list(map(lambda x: x.__dict__, attendances)), default=datetime.datetime.timestamp))
             if clear_from_device_on_fetch:
                 x = conn.clear_attendance()
                 info_logger.info("\t".join((ip, "Attendance Clear Attempted. Result:", str(x))))
+        
         x = conn.enable_device()
         info_logger.info("\t".join((ip, "Device Enable Attempted. Result:", str(x))))
-    except:
+    except Exception as e:
         error_logger.exception(str(ip)+' exception when fetching from device...')
         raise Exception('Device fetch failed.')
     finally:
         if conn:
             conn.disconnect()
     return list(map(lambda x: x.__dict__, attendances))
-
 
 def send_to_erpnext(employee_field_value, timestamp, device_id=None, log_type=None):
     """
@@ -210,15 +201,8 @@ def send_to_erpnext(employee_field_value, timestamp, device_id=None, log_type=No
             error_logger.error('\t'.join(['Error during ERPNext API Call.', str(employee_field_value), str(timestamp.timestamp()), str(device_id), str(log_type), error_str]))
         return response.status_code, error_str
 
-def update_shift_last_sync_timestamp(shift_type_device_mapping):
-    """
-    ### algo for updating the sync_current_timestamp
-    - get a list of devices to check
-    - check if all the devices have a non 'None' push_timestamp
-        - check if the earliest of the pull timestamp is greater than sync_current_timestamp for each shift name
-            - then update this min of pull timestamp to the shift
-
-    """
+def update_shift_last_sync_timestamp(shift_type_device_mapping, status):
+    """Updated to accept status parameter"""
     for shift_type_device_map in shift_type_device_mapping:
         all_devices_pushed = True
         pull_timestamp_array = []
@@ -227,18 +211,20 @@ def update_shift_last_sync_timestamp(shift_type_device_mapping):
                 all_devices_pushed = False
                 break
             pull_timestamp_array.append(_safe_convert_date(status.get(f'{device_id}_pull_timestamp'), "%Y-%m-%d %H:%M:%S.%f"))
-        if all_devices_pushed:
+        
+        if all_devices_pushed and pull_timestamp_array:  # Added check for non-empty array
             min_pull_timestamp = min(pull_timestamp_array)
-            if isinstance(shift_type_device_map['shift_type_name'], str): # for backward compatibility of config file
+            if isinstance(shift_type_device_map['shift_type_name'], str):
                 shift_type_device_map['shift_type_name'] = [shift_type_device_map['shift_type_name']]
+            
             for shift in shift_type_device_map['shift_type_name']:
                 try:
                     sync_current_timestamp = _safe_convert_date(status.get(f'{shift}_sync_timestamp'), "%Y-%m-%d %H:%M:%S.%f")
                     if (sync_current_timestamp and min_pull_timestamp > sync_current_timestamp) or (min_pull_timestamp and not sync_current_timestamp):
                         response_code = send_shift_sync_to_erpnext(shift, min_pull_timestamp)
                         if response_code == 200:
-                            status.set(f'{shift}_sync_timestamp', str(min_pull_timestamp))
-                except:
+                            status[f'{shift}_sync_timestamp'] = str(min_pull_timestamp)
+                except Exception as e:
                     error_logger.exception('Exception in update_shift_last_sync_timestamp, for shift:'+shift)
 
 def send_shift_sync_to_erpnext(shift_type_name, sync_timestamp):
